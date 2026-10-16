@@ -23,34 +23,53 @@ pub fn delay_for_wps(wps: f32) -> Duration {
 
 /// 启动一次输入任务，立即返回；UI 通过 [`Control`] 观察进度。
 pub fn start(text: String, speed: f32, control: Arc<Control>) {
-    control.begin();
+    let generation = control.begin();
 
     std::thread::spawn(move || {
-        if let Err(err) = run(&text, speed, &control) {
-            crate::log_line(format_args!("[typingbot] 输入引擎异常退出: {err}"));
+        // 无论正常返回还是 panic，都要让 `active` 落回 false，
+        // 否则界面会永远停在“打字中”。panic 之后平台可能进入不一致状态，
+        // 因此按“已取消”收尾。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(&text, speed, &control, generation)
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => crate::log_line(format_args!("[typingbot] 输入引擎异常退出: {err}")),
+            Err(_) => {
+                crate::log_line(format_args!(
+                    "[typingbot] 输入引擎内部错误（已中断本次输入）"
+                ));
+                control.finish(Reason::Cancelled);
+            }
         }
     });
 }
 
-fn run(text: &str, speed: f32, control: &Control) -> Result<(), String> {
+fn run(text: &str, speed: f32, control: &Control, generation: usize) -> Result<(), String> {
     let mut enigo =
         Enigo::new(&EnigoSettings::default()).map_err(|e| format!("无法初始化输入引擎: {e}"))?;
 
     let delay = delay_for_wps(speed);
     let chars: Vec<char> = text.chars().collect();
     control.total.store(chars.len(), Ordering::SeqCst);
+    crate::log_line(format_args!(
+        "[typingbot] 开始输入 {} 个字符（{} WPS）",
+        chars.len(),
+        speed.round() as i32
+    ));
 
     for (i, ch) in chars.iter().enumerate() {
-        if control.should_stop() {
+        // 过时代数 = 这次运行已被界面作废（停止 / 强制回到空闲），立刻收手。
+        if control.should_stop() || control.generation() != generation {
             control.finish(Reason::Cancelled);
             return Ok(());
         }
 
         // 暂停等待：每 30ms 轮询一次，同时持续检查停止请求。
-        while control.is_paused() && !control.should_stop() {
+        while control.is_paused() && !control.should_stop() && control.generation() == generation {
             std::thread::sleep(Duration::from_millis(30));
         }
-        if control.should_stop() {
+        if control.should_stop() || control.generation() != generation {
             control.finish(Reason::Cancelled);
             return Ok(());
         }
@@ -76,5 +95,6 @@ fn run(text: &str, speed: f32, control: &Control) -> Result<(), String> {
     }
 
     control.finish(Reason::Completed);
+    crate::log_line(format_args!("[typingbot] 输入完成"));
     Ok(())
 }

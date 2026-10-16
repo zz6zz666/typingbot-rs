@@ -229,6 +229,9 @@ Defaults can also be changed in `src/app.rs` (window size, layout constants) and
   resolves the same dependency versions anywhere.
 - Optional dev knob: set `TB_FONT_HINT=light` (or `normal`) to re-enable font hinting;
   the default is `off`, which renders dense CJK strokes more cleanly.
+- Optional dev knob: set `TB_AUTOSTART=1` to start typing right after launch (skipping
+  the countdown) with whatever text is stored — handy for testing the typing flow
+  without clicking.
 
 ## 🛡️ Antivirus
 

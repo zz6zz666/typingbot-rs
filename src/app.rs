@@ -23,6 +23,10 @@ const COUNTDOWN_WINDOW: egui::Vec2 = egui::vec2(260.0, 120.0);
 /// 倒计时浮窗距离屏幕底部的距离。
 const COUNTDOWN_BOTTOM_MARGIN: f32 = 100.0;
 
+/// 点了 Stop / 按了 ESC 之后，最多等输入线程多久。超过就认定它卡住了，
+/// 界面直接回到空闲（并让该线程作废），避免整个窗口被一次卡死的输入锁死。
+const STOP_GRACE: Duration = Duration::from_millis(1500);
+
 // ---------------------------------------------------------------------------
 // 统一的排版 / 间距尺度。所有界面元素都从这里取值，避免“忽大忽小”。
 // ---------------------------------------------------------------------------
@@ -105,6 +109,16 @@ enum Phase {
     Typing,
 }
 
+/// 过渡尺寸：倒计时浮窗（260×120）与打字临时高度（826）。
+///
+/// 这两种尺寸只是运行中的临时状态，不能当作“常规尺寸”的基准，
+/// 也不能在上次退出时被 eframe 存下来，否则下次启动窗口会偏高或变成一条。
+fn is_transitional_size(size: egui::Vec2) -> bool {
+    (size.y - TYPING_HEIGHT).abs() < 2.0
+        || (size.y - COUNTDOWN_WINDOW.y).abs() < 2.0
+        || (size.x - COUNTDOWN_WINDOW.x).abs() < 2.0
+}
+
 pub struct TypingBotApp {
     text: String,
     speed: f32,
@@ -142,6 +156,12 @@ pub struct TypingBotApp {
     theme_mode: ThemeMode,
     /// 主窗口的 HWND（去标题栏/去最大化按钮等 Win32 调整用）。
     window_hwnd: Option<usize>,
+    /// 请求停止后的宽限截止时间，见 [`STOP_GRACE`]。
+    stop_deadline: Option<Instant>,
+    /// 只在启动头几帧执行一次的“纠正上次遗留的过渡窗口高度”。
+    size_repaired: bool,
+    /// 开发/回归测试开关：`TB_AUTOSTART=1` 时启动即开始输入（跳过倒计时）。
+    auto_start: bool,
 }
 
 impl TypingBotApp {
@@ -194,6 +214,9 @@ impl TypingBotApp {
             applied_pinned: None,
             theme_mode,
             window_hwnd: window_handle(cc),
+            stop_deadline: None,
+            size_repaired: false,
+            auto_start: std::env::var("TB_AUTOSTART").is_ok_and(|v| v != "0" && !v.is_empty()),
         }
     }
 
@@ -375,11 +398,26 @@ impl TypingBotApp {
     fn on_typing_end(&mut self, ctx: &egui::Context) {
         let reason = self.control.take_reason();
         self.control.reset();
+        self.stop_deadline = None;
         self.phase = Phase::Idle;
         self.shrink_after_typing(ctx);
         if reason == Some(Reason::Cancelled) {
             self.notify(&notice(ICON_STOP, "Typing stopped"), false);
         }
+    }
+
+    /// 强制回到空闲：输入线程卡在系统调用里出不来时用（见 [`STOP_GRACE`]）。
+    ///
+    /// `reset()` 会推进代数，卡住的那个线程一旦返回就会自行结束，不会再输入。
+    fn force_idle(&mut self, ctx: &egui::Context) {
+        crate::log_line(format_args!(
+            "[typingbot] 输入线程在停止请求后仍未响应，已强制回到空闲"
+        ));
+        self.control.reset();
+        self.stop_deadline = None;
+        self.phase = Phase::Idle;
+        self.shrink_after_typing(ctx);
+        self.notify(&notice(ICON_STOP, "Typing stopped"), false);
     }
 
     /// 推进倒计时；到期则恢复主窗口并真正开打。
@@ -1502,6 +1540,24 @@ impl eframe::App for TypingBotApp {
         }
 
         self.place_window_once(&ctx);
+        // 上次退出时如果正处于打字 / 倒计时阶段，eframe 会把当时的过渡高度一起
+        // 存下来，于是这次启动窗口会偏高（甚至缩成一条）。头一帧纠正回常规尺寸。
+        if !self.size_repaired {
+            if let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) {
+                self.size_repaired = true;
+                if is_transitional_size(size) {
+                    crate::log_line(format_args!(
+                        "[typingbot] 修正上次遗留的过渡窗口高度 {:.0} → {:.0}",
+                        size.y, IDLE_HEIGHT
+                    ));
+                    self.base_size = egui::vec2(WINDOW_WIDTH, IDLE_HEIGHT);
+                    self.set_inner_size(&ctx, self.base_size);
+                }
+            } else {
+                // 视口尺寸还没就绪，下一帧再试。
+                ctx.request_repaint();
+            }
+        }
         self.sync_theme(&ctx);
         self.sync_pinned(&ctx);
 
@@ -1510,22 +1566,42 @@ impl eframe::App for TypingBotApp {
         if matches!(self.phase, Phase::Idle)
             && let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()))
         {
-            let transitional = (size.y - TYPING_HEIGHT).abs() < 1.0
-                || (size.y - COUNTDOWN_WINDOW.y).abs() < 1.0
-                || (size.x - COUNTDOWN_WINDOW.x).abs() < 1.0;
-            if !transitional && size.x > 200.0 && size.y > 200.0 {
+            if !is_transitional_size(size) && size.x > 200.0 && size.y > 200.0 {
                 self.base_size = size;
             }
         }
 
         // 工作线程结束检测（含自然结束 / Stop / ESC）。
+        //
+        // 不能只看 `was_active` 的“由真变假”边沿：很短的文本（例如 6 个字符、
+        // 100 WPS ≈ 10ms）会在同一帧里就跑完，边沿根本观察不到，界面会永久
+        // 停在打字态（按钮全灰、Stop 点了也没反应）。因此只要“阶段是打字”
+        // 而工作线程已经不活跃，就认为它结束了。
         let active = self.control.is_active();
-        if self.was_active && !active {
+        if !active && (self.was_active || matches!(self.phase, Phase::Typing)) {
             self.on_typing_end(&ctx);
         }
         self.was_active = active;
         if active {
             ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
+        // 已经请求过停止、但输入线程迟迟不结束（卡在系统调用里）：
+        // 宽限期一到就把界面拉回空闲，别让整个窗口被锁死。
+        if self.stop_deadline.is_none()
+            && active
+            && self.control.should_stop()
+            && matches!(self.phase, Phase::Typing)
+        {
+            self.stop_deadline = Some(Instant::now() + STOP_GRACE);
+        }
+        if let Some(deadline) = self.stop_deadline {
+            if !active {
+                self.stop_deadline = None;
+            } else if Instant::now() >= deadline {
+                self.force_idle(&ctx);
+                ctx.request_repaint();
+            }
         }
 
         // 倒计时期间按 Stop / ESC：global hotkey 会把 stop 置位。
@@ -1539,6 +1615,16 @@ impl eframe::App for TypingBotApp {
             self.stop_typing(&ctx);
         }
         self.advance_countdown(&ctx);
+
+        // 开发/回归测试用开关：启动即开始输入（跳过倒计时），方便自动化验证
+        // “输入结束 → 界面回到空闲”这条路径。
+        if self.auto_start && matches!(self.phase, Phase::Idle) && !self.text.trim().is_empty() {
+            self.auto_start = false;
+            let text = self.text.trim().to_string();
+            engine::start(text, self.speed, Arc::clone(&self.control));
+            self.grow_for_typing(&ctx);
+            self.phase = Phase::Typing;
+        }
 
         // 倒计时阶段：只画小浮窗，主界面暂不渲染（窗口此时已收缩）。
         if matches!(self.phase, Phase::Countdown { .. }) {
