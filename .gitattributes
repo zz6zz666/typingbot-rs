@@ -1,0 +1,7 @@
+# 统一换行：仓库内一律 LF，避免 Windows/Linux 之间整文件 diff
+* text=auto eol=lf
+
+# 二进制资源（不要做换行/文本转换）
+*.ico binary
+*.png binary
+*.rgba binary

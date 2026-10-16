@@ -1,0 +1,21 @@
+# Rust / Cargo
+/target
+/dist
+**/*.rs.bk
+*.pdb
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local artifacts
+*.zip
+*.log

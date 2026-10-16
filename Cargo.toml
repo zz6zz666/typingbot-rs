@@ -1,0 +1,37 @@
+[package]
+name = "typingbot-rs"
+version = "3.0.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["zz6zz666"]
+description = "Auto typing bot that bypasses paste restrictions — native Rust (egui/eframe) rewrite with a Material 3 UI"
+license = "MIT"
+repository = "https://github.com/zz6zz666/typingbot-rs"
+readme = "README.md"
+keywords = ["typing", "automation", "egui", "material3", "windows"]
+categories = ["gui", "os::windows-apis"]
+
+[dependencies]
+arboard = "3.6.1"
+dirs = "7.0.0"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+egui = { version = "0.36.2", default-features = false, features = ["default_fonts"] }
+enigo = "0.6.1"
+open = "5.4.4"
+raw-window-handle = "0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# 彩色 emoji：skrifa 遍历 COLR v1 图层，vello_cpu 栅格化成贴图。
+# 两个 crate epaint 已经在用，这里只是打开 traversal（COLR 遍历）能力。
+skrifa = { version = "0.44.0", default-features = false, features = ["std", "traversal"] }
+vello_cpu = { version = "0.1.0", default-features = false, features = ["std", "u8_pipeline", "f32_pipeline"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# 把 assets/icon.ico 与版本信息写进 exe 的资源段（仅 Windows 需要）。
+winresource = "0.1.23"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+codegen-units = 1
