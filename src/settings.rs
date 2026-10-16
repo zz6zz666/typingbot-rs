@@ -1,6 +1,10 @@
 //! 用户设置的 JSON 持久化（等价于 Python 版的 `user_settings.json`）。
 //!
 //! 写入位置：`%APPDATA%/TypingBot/settings.json`（`dirs::config_dir()`）。
+//!
+//! **正式构建完全不落盘**（单 exe 便携）：[`crate::writes_enabled`] 为假时
+//! 既不读也不写设置文件，每次启动都是默认值；只有调试构建 / `TB_STATE=1`
+//! 才读写，方便开发。见 [`Settings::load`] / [`Settings::save`]。
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -72,7 +76,13 @@ fn settings_path() -> Option<PathBuf> {
 
 impl Settings {
     /// 从磁盘读取；文件缺失或损坏时回落到默认值。
+    ///
+    /// 正式构建（不允许写盘）直接返回默认值：既不留文件，也不受旧文件影响，
+    /// 保证“换台机器拷过去就是干净的默认状态”。
     pub fn load() -> Self {
+        if !crate::writes_enabled() {
+            return Self::default();
+        }
         let Some(path) = settings_path() else {
             return Self::default();
         };
@@ -83,7 +93,12 @@ impl Settings {
     }
 
     /// 原子写入磁盘（失败静默，与 Python 版的 try/except 语义一致）。
+    ///
+    /// 正式构建不写盘：直接返回。
     pub fn save(&self) {
+        if !crate::writes_enabled() {
+            return;
+        }
         let Some(path) = settings_path() else {
             return;
         };

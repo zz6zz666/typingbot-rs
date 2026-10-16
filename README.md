@@ -49,9 +49,8 @@ Original project: [AprajitSarkar/typing-bot-bypass-paste](https://github.com/Apr
   else is typed through the clipboard (`Ctrl+V`) so any script works
 - **🎨 Material 3 Design**: purple (`#6750A4`) Material 3 palette, rounded cards,
   elevation shadows — same visual language as the Python build
-- **🌙 Dark / Light Mode**: self-drawn sun/moon toggle, remembered between runs
+- **🌙 Dark / Light Mode**: self-drawn sun/moon toggle (starts by following the system theme)
 - **📌 Always on Top**: **on by default**, with a pin button in the app bar
-  (state is remembered)
 - **🎯 Draggable window**: drag the app bar or use the native title bar
 - **🪟 Native window, no console**: system title bar and app icon (maximize button
   removed on purpose — the height is computed from content), runs as a GUI subsystem
@@ -60,9 +59,10 @@ Original project: [AprajitSarkar/typing-bot-bypass-paste](https://github.com/Apr
   real colours instead of monochrome outlines
 - **🔤 Crisp CJK text**: font fallback chain starting at **Microsoft YaHei**, with font
   hinting disabled so dense characters stay sharp
-- **💾 Settings persistence**: speed, theme, last text and pin state are saved to
-  `%APPDATA%\TypingBot\settings.json` (same shape as the Python version)
-- **📦 No dependencies at runtime**: single executable, portable
+- **📦 Fully portable, stateless**: one `.exe`, no installer, no runtime dependencies —
+  and it **writes nothing anywhere**: no settings file, no logs, no registry keys. Copy
+  it to another machine and it behaves exactly the same, starting from clean defaults
+  every launch
 
 ## 🚀 Use Cases
 
@@ -93,9 +93,11 @@ cargo build --release
 
 Result: `target\release\typingbot-rs.exe` (single file, no runtime dependencies).
 
-For development, `cargo run` / `cargo build` work the same way; note that the binary is
-a GUI-subsystem app on Windows (no console window), so runtime messages go to
-`%APPDATA%\TypingBot\typingbot.log` instead of stdout.
+For development, `cargo run` / `cargo build` work the same way. The binary is a
+GUI-subsystem app on Windows (no console window), so **debug builds** write runtime
+messages to `%APPDATA%\TypingBot\typingbot.log` instead of stdout. **Release builds
+write no log file at all** — set `TB_STATE=1` in the environment if you need one for
+troubleshooting.
 
 > The release profile uses `opt-level = "s"`, LTO and `strip = true`; `build.rs` embeds
 > `assets/icon.ico` plus the version information (`TypingBot (Rust Edition)`, author
@@ -133,9 +135,10 @@ a GUI-subsystem app on Windows (no console window), so runtime messages go to
 | Language | Rust 2024 (MSVC) | no runtime, single `.exe` |
 | GUI | `eframe` / `egui` 0.36 (glow) | immediate-mode UI, custom Material 3 widgets |
 | Colour emoji | `skrifa` (COLR v1 traversal) + `vello_cpu` | custom renderer, RGBA textures cached per glyph |
-| Synthetic input | `enigo` | Unicode via `arboard` clipboard + `Ctrl+V` |
-| Global hotkey | `rdev` | Esc cancels the running job |
-| Settings | `serde` / `serde_json` | `%APPDATA%\TypingBot\settings.json` |
+| Synthetic input | `enigo` | `SendInput`; ASCII as key events, any Unicode via `KEYEVENTF_UNICODE` |
+| Clipboard | `arboard` | the **Paste** button only (typing does not use the clipboard) |
+| Global hotkey | `SetWindowsHookExW(WH_KEYBOARD_LL)` (own hook) | Esc cancels the running job |
+| Settings | `serde` / `serde_json` | dev builds only — a release build stores nothing |
 | Window extras | `winresource`, `raw-window-handle` | exe icon/version, window style tweaks |
 | Fonts | Microsoft YaHei → Segoe UI Emoji → … | PUA icon font: Segoe Fluent Icons |
 
@@ -148,9 +151,10 @@ a GUI-subsystem app on Windows (no console window), so runtime messages go to
    ```
 
 2. **Character typing** — a worker thread walks the text:
-   - **ASCII** characters are sent directly as keystrokes (`enigo`)
-   - **Unicode** characters (Bangla, Chinese, emoji, …) are pushed to the clipboard and
-     pasted with `Ctrl+V`, then the previous clipboard text is restored
+   - ASCII characters are sent as key events (`enigo`)
+   - any other Unicode character (Bangla, Chinese, emoji, …) is sent as a
+     `KEYEVENTF_UNICODE` input event, so it works regardless of keyboard layout and
+     never touches your clipboard
    - newline / tab / space are handled explicitly
 3. **Control** — the UI thread and the worker share an atomic control block
    (index / paused / stop reason), so Start, Pause, Stop and the global Esc hook all
@@ -172,16 +176,29 @@ a GUI-subsystem app on Windows (no console window), so runtime messages go to
 | `src/main.rs` | window setup (size, icon, always-on-top, GUI subsystem) |
 | `src/app.rs` | all UI: header, editor, controls, overlays, fonts, layout maths |
 | `src/theme.rs` | Material 3 light/dark palettes |
-| `src/engine.rs` | typing worker (speed, clipboard, character pipeline) |
+| `src/engine.rs` | typing worker (speed, character pipeline) |
 | `src/control.rs` | shared atomic control/state between UI and worker |
 | `src/hotkey.rs` | global Esc listener |
-| `src/settings.rs` | settings load/save (`settings.json`) |
+| `src/settings.rs` | settings load/save (dev builds only — a release build is stateless) |
 | `src/emoji.rs` | COLR v1 colour-emoji renderer |
 | `build.rs` | embeds the exe icon + version info |
 
 ## 🔧 Configuration
 
-Settings live in `%APPDATA%\TypingBot\settings.json`:
+**There is no configuration file.** TypingBot is a stateless, portable tool: a release
+build never creates or modifies any file — no settings, no logs, no registry entries —
+and it does not read anything left behind by earlier runs, so every launch starts from
+the same defaults (speed 100 WPS, theme follows the system, always-on-top on).
+
+Defaults live in code and are easy to change:
+
+| What | Where |
+|------|-------|
+| Window size, layout spacing, countdown length | `src/app.rs` constants |
+| Default speed / theme / pin state | `src/settings.rs` |
+
+For development, set `TB_STATE=1` (or just use a debug build) and the app will persist
+`%APPDATA%\TypingBot\settings.json` between runs:
 
 ```json
 {
@@ -199,9 +216,6 @@ Settings live in `%APPDATA%\TypingBot\settings.json`:
 | `dark_mode` | Last effective theme (kept for the Python version's file format) |
 | `pinned` | Always-on-top state (the pin button in the app bar) |
 
-Defaults can also be changed in `src/app.rs` (window size, layout constants) and
-`src/settings.rs` (default speed / theme / pin state).
-
 ## 🐛 Troubleshooting
 
 | Problem | Solution |
@@ -212,7 +226,7 @@ Defaults can also be changed in `src/app.rs` (window size, layout constants) and
 | Countdown cancelled instantly | The global Esc hook also cancels the countdown; don't press Esc while positioning the cursor |
 | Window not on top | Click the pin button in the app bar (it is on by default) |
 | Antivirus / SmartScreen warning | See [ANTIVIRUS.md](ANTIVIRUS.md) |
-| Need to see what went wrong | Check the log at `%APPDATA%\TypingBot\typingbot.log` (the GUI build has no console) |
+| Need to see what went wrong | No console in a GUI build: debug builds log to `%APPDATA%\TypingBot\typingbot.log`; a release build does the same only when `TB_STATE=1` is set |
 
 ## 🧭 Environment Notes
 
@@ -222,16 +236,18 @@ Defaults can also be changed in `src/app.rs` (window size, layout constants) and
   or `cfg(windows)` build-dependencies, and missing system fonts (Microsoft YaHei,
   Segoe UI Emoji, …) are skipped gracefully, falling back to egui's bundled fonts.
 - System font paths are derived from `%WINDIR%` (not hard-coded to `C:\Windows`).
-- No machine-specific state is stored in the repo: settings live in
-  `%APPDATA%\TypingBot\settings.json`, window geometry in eframe's `app.ron`,
-  logs in `%APPDATA%\TypingBot\typingbot.log`.
+- **Portable by design: the app stores nothing.** A release build writes no files at all
+  (no settings, no logs, no window geometry — eframe's `persistence` feature is not even
+  enabled) and reads nothing back, so it is safe to run from a USB stick or a read-only
+  location. Debug builds (or `TB_STATE=1`) write `%APPDATA%\TypingBot\settings.json` and
+  `typingbot.log` for development only.
 - `Cargo.lock` is committed and points at the canonical crates.io index, so a clone
   resolves the same dependency versions anywhere.
 - Optional dev knob: set `TB_FONT_HINT=light` (or `normal`) to re-enable font hinting;
   the default is `off`, which renders dense CJK strokes more cleanly.
 - Optional dev knob: set `TB_AUTOSTART=1` to start typing right after launch (skipping
-  the countdown) with whatever text is stored — handy for testing the typing flow
-  without clicking.
+  the countdown) using the current text — handy for testing the typing flow without
+  clicking.
 
 ## 🛡️ Antivirus
 

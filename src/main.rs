@@ -1,4 +1,5 @@
-// 不带控制台子系统：双击 exe 不会再弹出黑窗口（日志落 `%APPDATA%\TypingBot\typingbot.log`）。
+// 不带控制台子系统：双击 exe 不会再弹出黑窗口。
+// 日志只在调试构建里写文件，正式构建默认不碰用户目录（排查时可用 TB_LOG=1 打开）。
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
@@ -11,11 +12,31 @@ mod theme;
 
 use egui::ViewportBuilder;
 
-/// 写一行日志：stderr（有控制台时可见）+ `%APPDATA%/TypingBot/typingbot.log`。
-/// GUI 子系统下多数情况没有控制台，所以文件那份才是关键；写失败一律静默丢弃
+/// 是否允许往磁盘写任何东西（日志、设置）。
+///
+/// 这是一个**单 exe 便携应用**：正式构建默认一个文件都不写 —— 不写日志、
+/// 不写设置、不写窗口几何，整个程序不落任何文件（也不读任何历史状态）。
+/// 只有开发时（`debug_assertions`）或显式设置环境变量 `TB_STATE=1`
+/// （旧名 `TB_LOG=1` 仍可用）才会写，方便排查问题。
+pub fn writes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| cfg!(debug_assertions) || env_flag("TB_STATE") || env_flag("TB_LOG"))
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
+/// 写一行日志（仅在 [`writes_enabled`] 为真时）：stderr（有控制台时可见）
+/// + `%APPDATA%/TypingBot/typingbot.log`。GUI 子系统下多数情况没有控制台，
+/// 所以文件那份才是关键；写失败一律静默丢弃
 /// （不能直接用 `eprintln!`：写失败会 panic）。
 pub fn log_line(args: std::fmt::Arguments<'_>) {
     use std::io::Write as _;
+
+    if !writes_enabled() {
+        return;
+    }
 
     let _ = writeln!(std::io::stderr(), "{args}");
 

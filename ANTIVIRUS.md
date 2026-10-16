@@ -27,9 +27,7 @@ to automated scanners.
 
 - Type the text you entered, character by character, only after you press *Start Typing*
 - Listen for a single global hotkey (**Esc**) to cancel a job
-- Read/write the clipboard (only to paste Unicode characters, and it restores your
-  previous clipboard content afterwards)
-- Save your settings to `%APPDATA%\TypingBot\settings.json`
+- Read the clipboard when you press the *Paste* button (typing itself never uses it)
 - Embed an icon and version resource in the exe
 
 ❌ **DOES NOT**
@@ -37,7 +35,9 @@ to automated scanners.
 - Access the network — **the Rust Edition has no networking code at all**
   (the Python version only ran a local Flask server on localhost for its UI)
 - Record, store or transmit keystrokes
-- Read files outside its own settings file
+- **Write anything to disk**: a release build creates no settings file, no log and no
+  registry keys — it is completely stateless and portable (debug builds may write
+  `%APPDATA%\TypingBot\` for development only)
 - Steal credentials or personal data
 - Modify system settings, services or startup entries
 - Hide itself: the window is a normal, visible, always-on-top desktop window
@@ -68,7 +68,8 @@ to automated scanners.
 ## Source code transparency
 
 All source code is in this repository — every capability listed above can be checked in
-`src/engine.rs` (typing), `src/hotkey.rs` (Esc hook) and `src/settings.rs` (persistence):
+`src/engine.rs` (typing), `src/hotkey.rs` (Esc hook) and `src/settings.rs` (the dev-only
+settings file; release builds never call it):
 
 - **This repository**: <https://github.com/zz6zz666/typingbot-rs>
 - **Original project (Python)**: <https://github.com/AprajitSarkar/typing-bot-bypass-paste>

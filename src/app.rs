@@ -27,6 +27,18 @@ const COUNTDOWN_BOTTOM_MARGIN: f32 = 100.0;
 /// 界面直接回到空闲（并让该线程作废），避免整个窗口被一次卡死的输入锁死。
 const STOP_GRACE: Duration = Duration::from_millis(1500);
 
+/// 打字开始后多久才为预览卡片增高窗口。
+///
+/// 极短的输入（几十毫秒就打完）如果也增高一下再立刻收回来，会看到窗口闪一下，
+/// 而且那么短的预览也没有意义；所以等输入确实还在继续时才增高。
+const PREVIEW_GROW_DELAY: Duration = Duration::from_millis(120);
+
+/// 窗口高度伸缩的过渡时长。
+///
+/// 直接改一次高度会让整块客户区瞬间跳一下（DWM 会把旧画面拉伸一帧，看着像窗口
+/// 被重新创建）。改成每帧挪一小步、160ms 走完，视觉上就是同一个窗口在伸缩。
+const HEIGHT_ANIM: Duration = Duration::from_millis(160);
+
 // ---------------------------------------------------------------------------
 // 统一的排版 / 间距尺度。所有界面元素都从这里取值，避免“忽大忽小”。
 // ---------------------------------------------------------------------------
@@ -138,8 +150,12 @@ pub struct TypingBotApp {
     was_active: bool,
     /// 进入倒计时前主窗口的位置与尺寸，倒计时结束后原样恢复。
     window_restore: Option<(egui::Pos2, egui::Vec2)>,
-    /// 为容纳实时预览而临时增高前的窗口尺寸，打字结束后原样恢复。
-    height_before_typing: Option<egui::Vec2>,
+    /// 为容纳实时预览而临时增高前的高度，打字结束后原样恢复（只改高度）。
+    height_before_typing: Option<f32>,
+    /// 进入打字阶段的时刻：用来判断这次输入是否长到值得显示预览卡片。
+    typing_since: Option<Instant>,
+    /// 高度伸缩过渡：(起始高度, 目标高度, 开始时刻)。
+    height_anim: Option<(f32, f32, Instant)>,
     /// 主窗口的“常规”尺寸（内容区）。只在空闲状态、且不在过渡动画中时更新，
     /// 所有自适应尺寸都以此为准，避免把倒计时浮窗 / 打字临时尺寸当成基准。
     base_size: egui::Vec2,
@@ -158,8 +174,6 @@ pub struct TypingBotApp {
     window_hwnd: Option<usize>,
     /// 请求停止后的宽限截止时间，见 [`STOP_GRACE`]。
     stop_deadline: Option<Instant>,
-    /// 只在启动头几帧执行一次的“纠正上次遗留的过渡窗口高度”。
-    size_repaired: bool,
     /// 开发/回归测试开关：`TB_AUTOSTART=1` 时启动即开始输入（跳过倒计时）。
     auto_start: bool,
 }
@@ -168,11 +182,9 @@ impl TypingBotApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
 
-        let settings = cc
-            .storage
-            .and_then(|s| s.get_string("settings"))
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(Settings::load);
+        // 便携模式：不使用 eframe 的存储（它会在用户目录建 data/app.ron）。
+        // 设置只在允许写盘的构建里从 settings.json 读，正式构建一律是默认值。
+        let settings = Settings::load();
 
         let theme_mode = settings.theme_mode();
         let dark = match theme_mode {
@@ -201,11 +213,13 @@ impl TypingBotApp {
             phase: Phase::Idle,
             notification: None,
             applied_dark: None,
-            // eframe 的 persistence 已还原窗口位置时无需再定位。
-            placed_window: cc.storage.is_some(),
+            // 不做任何持久化，启动时自己把窗口摆到屏幕右上角。
+            placed_window: false,
             was_active: false,
             window_restore: None,
             height_before_typing: None,
+            typing_since: None,
+            height_anim: None,
             base_size: egui::vec2(WINDOW_WIDTH, IDLE_HEIGHT),
             below_h: 380.0,
             min_window_h: 630.0,
@@ -215,7 +229,6 @@ impl TypingBotApp {
             theme_mode,
             window_hwnd: window_handle(cc),
             stop_deadline: None,
-            size_repaired: false,
             auto_start: std::env::var("TB_AUTOSTART").is_ok_and(|v| v != "0" && !v.is_empty()),
         }
     }
@@ -306,6 +319,8 @@ impl TypingBotApp {
     /// 直接复用主窗口，避免遮挡用户要点击的目标。
     fn enter_countdown_window(&mut self, ctx: &egui::Context) {
         let vp = ctx.input(|i| i.viewport().clone());
+        // 倒计时浮窗是另一次明确的尺寸切换，先取消未完成的高度过渡。
+        self.height_anim = None;
         // 位置取当前实际位置；尺寸用记录的“常规尺寸”，不用视口的临时值。
         let pos = vp.outer_rect.map(|r| r.min).unwrap_or(egui::pos2(0.0, 0.0));
         self.window_restore = Some((pos, self.base_size));
@@ -325,14 +340,18 @@ impl TypingBotApp {
     /// 恢复进入倒计时前的主窗口位置与尺寸。
     fn restore_window(&mut self, ctx: &egui::Context) {
         if let Some((pos, size)) = self.window_restore.take() {
-            // 顺序很重要：先恢复最小尺寸与标题栏，再放大，最后摆位置。
+            // 从浮窗切回常规窗口是“移动 + 换回标题栏 + 恢复尺寸”一次完成，
+            // 不适合再做高度过渡，先取消动画。
+            self.height_anim = None;
+            // 顺序很重要：先把标题栏恢复、窗口拉回常规尺寸与位置，最后才收紧最小尺寸。
+            // 反过来（当前窗口还很小、最小尺寸已经变大）系统会先把窗口撑一下，看着就是闪一下。
+            set_borderless(self.window_hwnd, false);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                 WINDOW_WIDTH,
                 self.min_window_h,
             )));
-            set_borderless(self.window_hwnd, false);
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
             self.base_size = size;
             ctx.request_repaint();
         }
@@ -341,6 +360,7 @@ impl TypingBotApp {
     /// 倒计时期间取消（Stop 按钮 / ESC）。
     fn cancel_countdown(&mut self, ctx: &egui::Context) {
         self.control.reset();
+        self.typing_since = None;
         self.restore_window(ctx);
         self.phase = Phase::Idle;
         self.notify(&notice(ICON_STOP, "Typing stopped"), false);
@@ -372,25 +392,74 @@ impl TypingBotApp {
         ctx.request_repaint();
     }
 
-    /// 打字开始时临时增高窗口以容纳实时预览卡片。
+    /// 只改窗口高度，宽度保持当前值。
     ///
-    /// 基准尺寸取自 `base_size`（空闲时记录的常规尺寸）。**不能**读取当前视口尺寸：
+    /// 打字开始/结束时的增高与收回都走这里：宽度不动，视觉上就像手动拖窗口下边缘。
+    fn set_inner_height(&self, ctx: &egui::Context, height: f32) {
+        let width = ctx
+            .input(|i| i.viewport().inner_rect.map(|r| r.width()))
+            .unwrap_or(self.base_size.x);
+        self.set_inner_size(ctx, egui::vec2(width, height));
+    }
+
+    /// 开始一段高度伸缩过渡（同一个窗口在“长高 / 收回”，不是重建窗口）。
+    fn animate_height_to(&mut self, ctx: &egui::Context, height: f32) {
+        let current = ctx
+            .input(|i| i.viewport().inner_rect.map(|r| r.height()))
+            .unwrap_or(self.base_size.y);
+        if (height - current).abs() < 1.0 {
+            self.height_anim = None;
+            return;
+        }
+        self.height_anim = Some((current, height, Instant::now()));
+        ctx.request_repaint();
+    }
+
+    /// 推进高度过渡：每帧挪一小步（ease-out），到位后精确落一次最终高度。
+    fn advance_height_anim(&mut self, ctx: &egui::Context) {
+        let Some((from, to, started)) = self.height_anim else {
+            return;
+        };
+        let total = HEIGHT_ANIM.as_secs_f32().max(0.001);
+        let t = (started.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
+        // ease-out：起步快、收尾稳，像手动拖到目标位置。
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let height = from + (to - from) * eased;
+
+        if t >= 1.0 {
+            self.height_anim = None;
+            self.set_inner_height(ctx, to);
+            return;
+        }
+        // 只有整像素变化时才真的让系统改一次窗口尺寸，避免无意义的重排。
+        let current = ctx
+            .input(|i| i.viewport().inner_rect.map(|r| r.height()))
+            .unwrap_or(from);
+        if (height.round() - current.round()).abs() >= 1.0 {
+            self.set_inner_height(ctx, height);
+        }
+        ctx.request_repaint_after(Duration::from_millis(8));
+    }
+
+    /// 打字开始时临时增高窗口以容纳实时预览卡片（只改高度）。
+    ///
+    /// 基准高度取自 `base_size`（空闲时记录的常规尺寸）。**不能**读取当前视口尺寸：
     /// 倒计时刚结束时视口还停留在浮窗的 260×120 上，用它做基准会把窗口缩成一条。
     fn grow_for_typing(&mut self, ctx: &egui::Context) {
-        let base = self.base_size;
-        if base.y + 1.0 < TYPING_HEIGHT {
-            self.height_before_typing = Some(base);
-            self.set_inner_size(ctx, egui::vec2(base.x, TYPING_HEIGHT));
+        let base_h = self.base_size.y;
+        if base_h + 1.0 < TYPING_HEIGHT {
+            self.height_before_typing = Some(base_h);
+            self.animate_height_to(ctx, TYPING_HEIGHT);
         } else {
             self.height_before_typing = None;
         }
     }
 
-    /// 打字结束：恢复到打字前的尺寸（宽高一起，避免残留临时宽度）。
+    /// 打字结束：把高度收回打字前的高度（宽度自始至终不动）。
     fn shrink_after_typing(&mut self, ctx: &egui::Context) {
-        if let Some(size) = self.height_before_typing.take() {
-            self.base_size = size;
-            self.set_inner_size(ctx, size);
+        if let Some(height) = self.height_before_typing.take() {
+            self.base_size.y = height;
+            self.animate_height_to(ctx, height);
         }
     }
 
@@ -399,6 +468,7 @@ impl TypingBotApp {
         let reason = self.control.take_reason();
         self.control.reset();
         self.stop_deadline = None;
+        self.typing_since = None;
         self.phase = Phase::Idle;
         self.shrink_after_typing(ctx);
         if reason == Some(Reason::Cancelled) {
@@ -415,6 +485,7 @@ impl TypingBotApp {
         ));
         self.control.reset();
         self.stop_deadline = None;
+        self.typing_since = None;
         self.phase = Phase::Idle;
         self.shrink_after_typing(ctx);
         self.notify(&notice(ICON_STOP, "Typing stopped"), false);
@@ -436,7 +507,7 @@ impl TypingBotApp {
             return;
         }
         engine::start(text, self.speed, Arc::clone(&self.control));
-        self.grow_for_typing(ctx);
+        self.typing_since = Some(Instant::now());
         self.phase = Phase::Typing;
     }
 }
@@ -1540,30 +1611,15 @@ impl eframe::App for TypingBotApp {
         }
 
         self.place_window_once(&ctx);
-        // 上次退出时如果正处于打字 / 倒计时阶段，eframe 会把当时的过渡高度一起
-        // 存下来，于是这次启动窗口会偏高（甚至缩成一条）。头一帧纠正回常规尺寸。
-        if !self.size_repaired {
-            if let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())) {
-                self.size_repaired = true;
-                if is_transitional_size(size) {
-                    crate::log_line(format_args!(
-                        "[typingbot] 修正上次遗留的过渡窗口高度 {:.0} → {:.0}",
-                        size.y, IDLE_HEIGHT
-                    ));
-                    self.base_size = egui::vec2(WINDOW_WIDTH, IDLE_HEIGHT);
-                    self.set_inner_size(&ctx, self.base_size);
-                }
-            } else {
-                // 视口尺寸还没就绪，下一帧再试。
-                ctx.request_repaint();
-            }
-        }
+        // 高度伸缩过渡（打字增高 / 结束收回）：每帧推一小步，避免整块客户区跳一下。
+        self.advance_height_anim(&ctx);
         self.sync_theme(&ctx);
         self.sync_pinned(&ctx);
-
         // 记录“常规”窗口尺寸：只在空闲状态、且尺寸不是过渡值时更新。
-        // 倒计时浮窗（260×120）和打字临时高度（826）都不能当作基准。
+        // 倒计时浮窗（260×120）和打字临时高度（826）都不能当作基准，
+        // 伸缩过渡中间的中间值（例如 750）同样不能。
         if matches!(self.phase, Phase::Idle)
+            && self.height_anim.is_none()
             && let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()))
         {
             if !is_transitional_size(size) && size.x > 200.0 && size.y > 200.0 {
@@ -1584,6 +1640,16 @@ impl eframe::App for TypingBotApp {
         self.was_active = active;
         if active {
             ctx.request_repaint_after(Duration::from_millis(16));
+            // 输入确实还在继续，才为预览卡片增高窗口（只改高度）。
+            // 极短的输入（几十毫秒打完）不会增高，也就不会出现“撑开又立刻收回”的闪烁。
+            if matches!(self.phase, Phase::Typing)
+                && self.height_before_typing.is_none()
+                && self
+                    .typing_since
+                    .is_some_and(|t| t.elapsed() >= PREVIEW_GROW_DELAY)
+            {
+                self.grow_for_typing(&ctx);
+            }
         }
 
         // 已经请求过停止、但输入线程迟迟不结束（卡在系统调用里）：
@@ -1616,14 +1682,19 @@ impl eframe::App for TypingBotApp {
         }
         self.advance_countdown(&ctx);
 
-        // 开发/回归测试用开关：启动即开始输入（跳过倒计时），方便自动化验证
-        // “输入结束 → 界面回到空闲”这条路径。
+        // 开发/回归测试用开关：启动即开始输入，方便自动化验证。
+        // `TB_AUTOSTART=1` 跳过倒计时直接开打；`TB_AUTOSTART=countdown` 走完整流程。
         if self.auto_start && matches!(self.phase, Phase::Idle) && !self.text.trim().is_empty() {
+            let mode = std::env::var("TB_AUTOSTART").unwrap_or_default();
             self.auto_start = false;
-            let text = self.text.trim().to_string();
-            engine::start(text, self.speed, Arc::clone(&self.control));
-            self.grow_for_typing(&ctx);
-            self.phase = Phase::Typing;
+            if mode == "countdown" {
+                self.start_countdown(&ctx);
+            } else {
+                let text = self.text.trim().to_string();
+                engine::start(text, self.speed, Arc::clone(&self.control));
+                self.typing_since = Some(Instant::now());
+                self.phase = Phase::Typing;
+            }
         }
 
         // 倒计时阶段：只画小浮窗，主界面暂不渲染（窗口此时已收缩）。
@@ -1735,18 +1806,6 @@ impl eframe::App for TypingBotApp {
 
         self.overlays(&ctx, window_rect);
         self.persist();
-    }
-
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        // 窗口几何由 eframe 的 persistence 特性负责，这里只存业务设置。
-        self.settings.speed = self.speed;
-        self.settings.dark_mode = self.dark;
-        self.settings.theme = Some(self.theme_mode);
-        self.settings.last_text = self.text.clone();
-        self.settings.pinned = self.pinned;
-        if let Ok(raw) = serde_json::to_string(&self.settings) {
-            storage.set_string("settings", raw);
-        }
     }
 }
 
@@ -1951,10 +2010,12 @@ mod win {
             } else {
                 style | FRAME_BITS
             };
-            set_rounded(hwnd, borderless);
             if want == style {
+                // 样式没变就什么都不做：不要每帧去动 DWM 的圆角/边框，
+                // 那会让窗口被反复重组，看起来像在闪。
                 return false;
             }
+            set_rounded(hwnd, borderless);
             apply_style(hwnd, want);
             true
         }
