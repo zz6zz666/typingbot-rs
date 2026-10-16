@@ -3,6 +3,8 @@
 <div align="center">
 
 ![TypingBot](https://img.shields.io/badge/TypingBot-v3.0.0-6750A4?style=for-the-badge)
+[![Release](https://img.shields.io/github/v/release/zz6zz666/typingbot-rs?style=for-the-badge&color=6750A4&label=Release)](https://github.com/zz6zz666/typingbot-rs/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/zz6zz666/typingbot-rs/total?style=for-the-badge&color=6750A4&label=Downloads)](https://github.com/zz6zz666/typingbot-rs/releases)
 ![Rust](https://img.shields.io/badge/Rust-2024-000000?style=for-the-badge&logo=rust)
 ![egui](https://img.shields.io/badge/UI-egui%20%2F%20eframe-6750A4?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D4?style=for-the-badge&logo=windows)
@@ -14,7 +16,7 @@ A native **Rust rewrite** of the original Python TypingBot: one self-contained
 `.exe`, no Python runtime, no embedded browser — same Material 3 interface,
 same workflow.
 
-[Features](#-features) • [Build](#-building-from-source) • [Usage](#-usage) • [Tech Stack](#-tech-stack) • [Credits](#-credits--acknowledgements)
+[Download](#️-download) • [Features](#-features) • [Build](#-building-from-source) • [Usage](#-usage) • [Tech Stack](#-tech-stack) • [Credits](#-credits--acknowledgements)
 
 </div>
 
@@ -35,18 +37,37 @@ no browser engine).
 
 Original project: [AprajitSarkar/typing-bot-bypass-paste](https://github.com/AprajitSarkar/typing-bot-bypass-paste)
 
+## ⬇️ Download
+
+**[Latest release: v3.0.0](https://github.com/zz6zz666/typingbot-rs/releases/latest)** — no installer,
+no setup, nothing to configure:
+
+| File | What it is |
+|------|------------|
+| [`TypingBot_v3.0.0.exe`](https://github.com/zz6zz666/typingbot-rs/releases/download/v3.0.0/TypingBot_v3.0.0.exe) | The app: a single ~5 MB portable executable (Windows 10/11, x64) |
+| [`TypingBot_v3.0.0.exe.sha256`](https://github.com/zz6zz666/typingbot-rs/releases/download/v3.0.0/TypingBot_v3.0.0.exe.sha256) | Checksum for the download (`sha256sum -c` compatible) |
+
+Download it, paste your text, press **Start Typing** — that's the whole setup. The exe is
+unsigned, so Windows may show a SmartScreen prompt on first launch: see
+[ANTIVIRUS.md](ANTIVIRUS.md). Prefer to compile it yourself?
+See [Building from Source](#-building-from-source).
+
+All versions, release notes and checksums: **[Releases →](https://github.com/zz6zz666/typingbot-rs/releases)**
+
 ## 🌟 Features
 
 - **⚡ Variable Typing Speed**: 1 → 500 words per second (WPS), live readout
 - **🔄 Auto-Type**: character-by-character synthetic keystrokes to bypass paste restrictions
-- **⏱️ Countdown Timer**: 3-second countdown (the window shrinks to a small card at the
-  bottom of the screen so it does not cover your target), then typing starts
+- **⏱️ Countdown Timer**: 3-second countdown — the main window slides away and comes back
+  as a small card at the bottom of the screen (so it does not cover your target), then
+  typing starts
 - **⏸ Start / Pause / Stop**: resume mid-way, stop instantly, or press **Esc** anywhere
   (global hotkey) to cancel
 - **👁️ Live Preview**: while typing, the input box highlights the text and shows the
   current position
-- **🌏 Unicode / Bangla / CJK / Emoji**: ASCII goes through the keyboard API, everything
-  else is typed through the clipboard (`Ctrl+V`) so any script works
+- **🌏 Unicode / Bangla / CJK / Emoji**: ASCII goes out as key events, everything else as
+  `KEYEVENTF_UNICODE` input — any script works, regardless of keyboard layout, and your
+  clipboard is never touched
 - **🎨 Material 3 Design**: purple (`#6750A4`) Material 3 palette, rounded cards,
   elevation shadows — same visual language as the Python build
 - **🌙 Dark / Light Mode**: self-drawn sun/moon toggle (starts by following the system theme)
