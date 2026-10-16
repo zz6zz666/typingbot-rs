@@ -39,6 +39,39 @@ const PREVIEW_GROW_DELAY: Duration = Duration::from_millis(120);
 /// 被重新创建）。改成每帧挪一小步、160ms 走完，视觉上就是同一个窗口在伸缩。
 const HEIGHT_ANIM: Duration = Duration::from_millis(160);
 
+/// 主窗口滑出屏幕下缘的时长（尺寸不变，只位移）。
+const SLIDE_OUT: Duration = Duration::from_millis(240);
+/// 倒计时卡片从屏幕下缘推入 / 主窗口滑回原位的时长。
+const SLIDE_IN: Duration = Duration::from_millis(190);
+
+/// 主窗口 ↔ 倒计时浮窗之间的过渡动画。
+///
+/// 两段式：先把窗口整体滑到屏幕下缘之外，在**看不见的地方**完成“换标题栏 /
+/// 换客户区尺寸 / 换渲染内容”，再从屏幕下侧推入目标位置。这样整段过程看上去
+/// 只是同一个窗口滑下去、又以卡片形式推上来，不会出现跳变或闪烁。
+struct Motion {
+    kind: MotionKind,
+    /// 0 = 正在滑出屏幕，1 = 正在滑入到位。
+    step: u8,
+    started: Instant,
+    /// 本段起点：外框位置 + 客户区尺寸（逻辑点）。
+    from: [f32; 4],
+    /// 最终目标（同上）。
+    target: [f32; 4],
+    /// 屏幕下缘之外的 y（逻辑点）。
+    off_y: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MotionKind {
+    /// 主窗口 → 倒计时卡片（结束后开始计时）。
+    EnterCountdown,
+    /// 卡片 → 主窗口（结束后开始打字）。
+    EnterTyping,
+    /// 卡片 → 主窗口（结束后停在空闲，用于取消/ESC）。
+    BackToIdle,
+}
+
 // ---------------------------------------------------------------------------
 // 统一的排版 / 间距尺度。所有界面元素都从这里取值，避免“忽大忽小”。
 // ---------------------------------------------------------------------------
@@ -156,6 +189,8 @@ pub struct TypingBotApp {
     typing_since: Option<Instant>,
     /// 高度伸缩过渡：(起始高度, 目标高度, 开始时刻)。
     height_anim: Option<(f32, f32, Instant)>,
+    /// 主窗口与倒计时浮窗之间的滑动过渡。
+    motion: Option<Motion>,
     /// 主窗口的“常规”尺寸（内容区）。只在空闲状态、且不在过渡动画中时更新，
     /// 所有自适应尺寸都以此为准，避免把倒计时浮窗 / 打字临时尺寸当成基准。
     base_size: egui::Vec2,
@@ -220,6 +255,7 @@ impl TypingBotApp {
             height_before_typing: None,
             typing_since: None,
             height_anim: None,
+            motion: None,
             base_size: egui::vec2(WINDOW_WIDTH, IDLE_HEIGHT),
             below_h: 380.0,
             min_window_h: 630.0,
@@ -307,63 +343,237 @@ impl TypingBotApp {
         }
         // 清掉可能残留的停止标志（例如空闲时按过 ESC）。
         self.control.reset();
-        self.enter_countdown_window(ctx);
+        // 记下主窗口现在的位置与尺寸，倒计时结束后原样滑回去。
+        let vp = ctx.input(|i| i.viewport().clone());
+        let pos = vp.outer_rect.map(|r| r.min).unwrap_or(egui::pos2(0.0, 0.0));
+        self.window_restore = Some((pos, self.base_size));
         self.phase = Phase::Countdown {
             started: Instant::now(),
         };
+        // 先滑出屏幕，再以卡片形式从屏幕下侧推入（换尺寸/换标题栏都在屏幕外完成）。
+        self.start_motion(ctx, MotionKind::EnterCountdown);
     }
 
-    /// 收缩主窗口为屏幕底部居中的小倒计时浮窗。
-    ///
-    /// Python 版在倒计时期间 `withdraw()` 主窗口并单独弹出一个小窗，这里改为
-    /// 直接复用主窗口，避免遮挡用户要点击的目标。
-    fn enter_countdown_window(&mut self, ctx: &egui::Context) {
-        let vp = ctx.input(|i| i.viewport().clone());
-        // 倒计时浮窗是另一次明确的尺寸切换，先取消未完成的高度过渡。
-        self.height_anim = None;
-        // 位置取当前实际位置；尺寸用记录的“常规尺寸”，不用视口的临时值。
-        let pos = vp.outer_rect.map(|r| r.min).unwrap_or(egui::pos2(0.0, 0.0));
-        self.window_restore = Some((pos, self.base_size));
-        // 倒计时浮窗不需要标题栏（egui 的 Decorations 命令在这里不生效，直接改窗口样式）。
-        set_borderless(self.window_hwnd, true);
-        if let Some(monitor) = vp.monitor_size {
-            let x = ((monitor.x - COUNTDOWN_WINDOW.x) / 2.0).max(0.0);
-            let y = (monitor.y - COUNTDOWN_WINDOW.y - COUNTDOWN_BOTTOM_MARGIN).max(0.0);
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+    // ------------------------------------------------------- 窗口滑动过渡
+
+    /// 显示器的逻辑矩形：左、上、宽、高。
+    fn monitor_logical(&self, ctx: &egui::Context) -> (f32, f32, f32, f32) {
+        let ppp = ctx.pixels_per_point().max(0.1);
+        if let Some((l, t, r, b)) = self.window_hwnd.and_then(window_monitor_rect) {
+            return (
+                l as f32 / ppp,
+                t as f32 / ppp,
+                (r - l) as f32 / ppp,
+                (b - t) as f32 / ppp,
+            );
         }
-        // 倒计时浮窗比常规窗口小得多：先放宽最小尺寸，否则会被窗口管理器挡住。
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(COUNTDOWN_WINDOW));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(COUNTDOWN_WINDOW));
+        // 退路（非 Windows 或还没拿到 HWND）：按主显示器原点 0 处理。
+        let size = ctx
+            .input(|i| i.viewport().monitor_size)
+            .unwrap_or(egui::vec2(1920.0, 1080.0));
+        (0.0, 0.0, size.x, size.y)
+    }
+
+    /// 当前窗口的“外框位置 + 客户区尺寸”（逻辑点）。
+    fn current_rect(&self, ctx: &egui::Context) -> [f32; 4] {
+        let vp = ctx.input(|i| i.viewport().clone());
+        let pos = vp.outer_rect.map(|r| r.min).unwrap_or(egui::pos2(0.0, 0.0));
+        let size = vp.inner_rect.map(|r| r.size()).unwrap_or(self.base_size);
+        [pos.x, pos.y, size.x, size.y]
+    }
+
+    /// 倒计时卡片的目标位置：屏幕底部居中。
+    fn popup_rect(&self, ctx: &egui::Context) -> [f32; 4] {
+        let (_, _, mw, mh) = self.monitor_logical(ctx);
+        [
+            (mw - COUNTDOWN_WINDOW.x) / 2.0,
+            mh - COUNTDOWN_WINDOW.y - COUNTDOWN_BOTTOM_MARGIN,
+            COUNTDOWN_WINDOW.x,
+            COUNTDOWN_WINDOW.y,
+        ]
+    }
+
+    /// 主窗口的目标位置：进入倒计时前记录的那一份。
+    fn main_rect(&self) -> [f32; 4] {
+        match self.window_restore {
+            Some((pos, size)) => [pos.x, pos.y, size.x, size.y],
+            None => [0.0, 0.0, WINDOW_WIDTH, IDLE_HEIGHT],
+        }
+    }
+
+    fn start_motion(&mut self, ctx: &egui::Context, kind: MotionKind) {
+        let from = self.current_rect(ctx);
+        let target = match kind {
+            MotionKind::EnterCountdown => self.popup_rect(ctx),
+            MotionKind::EnterTyping | MotionKind::BackToIdle => self.main_rect(),
+        };
+        let (_, _, _, mh) = self.monitor_logical(ctx);
+        self.height_anim = None;
+        self.motion = Some(Motion {
+            kind,
+            step: 0,
+            started: Instant::now(),
+            from,
+            target,
+            // 完全滑出屏幕下缘：整块窗口都在外面，任何切换都看不见。
+            off_y: mh + 8.0,
+        });
         ctx.request_repaint();
     }
 
-    /// 恢复进入倒计时前的主窗口位置与尺寸。
-    fn restore_window(&mut self, ctx: &egui::Context) {
-        if let Some((pos, size)) = self.window_restore.take() {
-            // 从浮窗切回常规窗口是“移动 + 换回标题栏 + 恢复尺寸”一次完成，
-            // 不适合再做高度过渡，先取消动画。
-            self.height_anim = None;
-            // 顺序很重要：先把标题栏恢复、窗口拉回常规尺寸与位置，最后才收紧最小尺寸。
-            // 反过来（当前窗口还很小、最小尺寸已经变大）系统会先把窗口撑一下，看着就是闪一下。
-            set_borderless(self.window_hwnd, false);
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                WINDOW_WIDTH,
-                self.min_window_h,
-            )));
-            self.base_size = size;
-            ctx.request_repaint();
+    fn apply_rect(&self, ctx: &egui::Context, rect: [f32; 4]) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            rect[2], rect[3],
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            rect[0], rect[1],
+        )));
+    }
+
+    /// 推进滑动过渡。每帧挪一小步，看起来就是同一个窗口在滑动。
+    fn advance_motion(&mut self, ctx: &egui::Context) {
+        let Some(m) = self.motion.as_ref() else {
+            return;
+        };
+        let (duration, from, to) = if m.step == 0 {
+            // 滑出：只位移，尺寸保持不变（避免主界面被挤成一团）。
+            (
+                SLIDE_OUT,
+                m.from,
+                [m.target[0], m.off_y, m.from[2], m.from[3]],
+            )
+        } else {
+            // 滑入：从屏幕外竖直推到目标位置（尺寸已在屏幕外切好）。
+            (
+                SLIDE_IN,
+                [m.target[0], m.off_y, m.target[2], m.target[3]],
+                m.target,
+            )
+        };
+        let t = (m.started.elapsed().as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let mut rect = [0.0_f32; 4];
+        for i in 0..4 {
+            rect[i] = from[i] + (to[i] - from[i]) * eased;
+        }
+        self.apply_rect(ctx, rect);
+
+        if t >= 1.0 {
+            if m.step == 0 {
+                self.motion_switch(ctx);
+            } else {
+                self.motion_finish(ctx);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// 屏幕外那一瞬间：把标题栏、客户区尺寸、渲染内容一次性切到目标状态。
+    fn motion_switch(&mut self, ctx: &egui::Context) {
+        let Some(m) = self.motion.as_ref() else {
+            return;
+        };
+        let (kind, target, off_y) = (m.kind, m.target, m.off_y);
+        match kind {
+            MotionKind::EnterCountdown => {
+                // 卡片是浮窗：去掉标题栏，并放宽最小尺寸限制。
+                set_borderless(self.window_hwnd, true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(COUNTDOWN_WINDOW));
+                self.phase = Phase::Countdown {
+                    started: Instant::now(),
+                };
+            }
+            MotionKind::EnterTyping | MotionKind::BackToIdle => {
+                // 回到主窗口：先切成主窗口尺寸，再恢复标题栏与最小尺寸。
+                self.base_size = egui::vec2(target[2], target[3]);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    target[2], target[3],
+                )));
+                set_borderless(self.window_hwnd, false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                    WINDOW_WIDTH,
+                    self.min_window_h,
+                )));
+            }
+        }
+        let off = [target[0], off_y, target[2], target[3]];
+        self.apply_rect(ctx, off);
+        if let Some(m) = self.motion.as_mut() {
+            m.step = 1;
+            m.started = Instant::now();
+            m.from = off;
+        }
+        ctx.request_repaint();
+    }
+
+    /// 滑动结束：按过渡类型收尾。
+    fn motion_finish(&mut self, ctx: &egui::Context) {
+        let Some(m) = self.motion.take() else {
+            return;
+        };
+        match m.kind {
+            MotionKind::EnterCountdown => {
+                // 卡片就位，倒计时从这一刻开始数。
+                self.phase = Phase::Countdown {
+                    started: Instant::now(),
+                };
+            }
+            MotionKind::EnterTyping => {
+                self.window_restore = None;
+                self.begin_typing(ctx);
+            }
+            MotionKind::BackToIdle => {
+                self.window_restore = None;
+                self.phase = Phase::Idle;
+                self.notify(&notice(ICON_STOP, "Typing stopped"), false);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// 真正开始输入（主窗口滑回原位之后调用）。
+    fn begin_typing(&mut self, ctx: &egui::Context) {
+        let text = self.text.trim().to_string();
+        if text.is_empty() {
+            self.notify(&notice(ICON_WARNING, "Please enter some text"), true);
+            self.phase = Phase::Idle;
+            return;
+        }
+        engine::start(text, self.speed, Arc::clone(&self.control));
+        self.typing_since = Some(Instant::now());
+        self.phase = Phase::Typing;
+        ctx.request_repaint();
+    }
+
+    /// 当前这一帧该画倒计时卡片吗（滑动过程中，屏幕外那一半画目标内容）。
+    fn show_countdown_card(&self) -> bool {
+        match &self.motion {
+            Some(m) => match (m.kind, m.step) {
+                // 主界面正在滑出：继续画主界面。
+                (MotionKind::EnterCountdown, 0) => false,
+                // 卡片正在推入：画卡片。
+                (MotionKind::EnterCountdown, _) => true,
+                // 卡片正在滑出：画卡片。
+                (_, 0) => true,
+                // 主界面正在滑回：画主界面。
+                (_, _) => false,
+            },
+            None => matches!(self.phase, Phase::Countdown { .. }),
         }
     }
 
-    /// 倒计时期间取消（Stop 按钮 / ESC）。
+    /// 倒计时期间取消（Stop 按钮 / ESC）——同样用滑动过渡滑回主窗口，
+    /// 只是结束时停在空闲、不开始打字。
     fn cancel_countdown(&mut self, ctx: &egui::Context) {
         self.control.reset();
         self.typing_since = None;
-        self.restore_window(ctx);
-        self.phase = Phase::Idle;
-        self.notify(&notice(ICON_STOP, "Typing stopped"), false);
+        if self.window_restore.is_none() {
+            // 理论上不会发生（没记录过主窗口位置），直接收尾。
+            self.phase = Phase::Idle;
+            self.notify(&notice(ICON_STOP, "Typing stopped"), false);
+            return;
+        }
+        self.start_motion(ctx, MotionKind::BackToIdle);
     }
 
     fn toggle_pause(&mut self) {
@@ -491,24 +701,19 @@ impl TypingBotApp {
         self.notify(&notice(ICON_STOP, "Typing stopped"), false);
     }
 
-    /// 推进倒计时；到期则恢复主窗口并真正开打。
+    /// 推进倒计时；到期则走滑动过渡把主窗口滑回来，落地后才真正开打。
     fn advance_countdown(&mut self, ctx: &egui::Context) {
         let Phase::Countdown { started } = self.phase else {
             return;
         };
+        // 滑动过渡期间不计时：卡片推入到位才开始数 3 秒。
+        if self.motion.is_some() {
+            return;
+        }
         if started.elapsed().as_secs_f32() < COUNTDOWN_SECS {
             return;
         }
-        self.restore_window(ctx);
-        let text = self.text.trim().to_string();
-        if text.is_empty() {
-            self.notify(&notice(ICON_WARNING, "Please enter some text"), true);
-            self.phase = Phase::Idle;
-            return;
-        }
-        engine::start(text, self.speed, Arc::clone(&self.control));
-        self.typing_since = Some(Instant::now());
-        self.phase = Phase::Typing;
+        self.start_motion(ctx, MotionKind::EnterTyping);
     }
 }
 
@@ -1602,17 +1807,16 @@ impl eframe::App for TypingBotApp {
         // 窗口不需要最大化：去掉标题栏上的最大化按钮（仍可自由拉伸）。
         // winit 会在启动阶段把样式位加回来，所以每帧都检查一次（只在需要时才改）。
         hide_maximize_button(self.window_hwnd);
-        // 倒计时浮窗不要标题栏；winit 会不定时重写窗口样式，所以每帧校正一次
-        // （只在需要时才真正改，不会每帧重画边框）。去掉边框会把外框尺寸并进
-        // 客户区，所以改完再按浮窗尺寸压一次。
-        let in_countdown = matches!(self.phase, Phase::Countdown { .. });
-        if set_borderless(self.window_hwnd, in_countdown) && in_countdown {
-            self.set_inner_size(&ctx, COUNTDOWN_WINDOW);
-        }
+        // 标题栏只在“卡片场景”去掉。真正的切换发生在屏幕下缘之外（见 motion_switch），
+        // 这里只是每帧校正一次，防止 winit 中途把样式改回去。
+        let card_scene = self.show_countdown_card();
+        set_borderless(self.window_hwnd, card_scene);
 
         self.place_window_once(&ctx);
         // 高度伸缩过渡（打字增高 / 结束收回）：每帧推一小步，避免整块客户区跳一下。
         self.advance_height_anim(&ctx);
+        // 主窗口 ↔ 倒计时浮窗的滑动过渡。
+        self.advance_motion(&ctx);
         self.sync_theme(&ctx);
         self.sync_pinned(&ctx);
         // 记录“常规”窗口尺寸：只在空闲状态、且尺寸不是过渡值时更新。
@@ -1697,8 +1901,8 @@ impl eframe::App for TypingBotApp {
             }
         }
 
-        // 倒计时阶段：只画小浮窗，主界面暂不渲染（窗口此时已收缩）。
-        if matches!(self.phase, Phase::Countdown { .. }) {
+        // 倒计时卡片场景（含推入/滑出过程）：只画卡片，主界面暂不渲染。
+        if self.show_countdown_card() {
             self.render_countdown(&ctx, window_rect);
             self.persist();
             return;
@@ -1807,6 +2011,12 @@ impl eframe::App for TypingBotApp {
         self.overlays(&ctx, window_rect);
         self.persist();
     }
+
+    /// 窗口背景清成界面底色：任何一帧里“刚露出来还没画到”的区域都是底色，
+    /// 不会闪出黑块或透明块。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        self.palette.background.to_normalized_gamma_f32()
+    }
 }
 
 // ------------------------------------------------------------------ 窗口样式
@@ -1904,6 +2114,17 @@ fn set_borderless(_hwnd: Option<usize>, _borderless: bool) -> bool {
     false
 }
 
+/// 窗口所在显示器的矩形（物理像素：左、上、右、下）。
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn window_monitor_rect(hwnd: usize) -> Option<(i32, i32, i32, i32)> {
+    win::monitor_rect(hwnd)
+}
+
+#[cfg(not(all(windows, target_pointer_width = "64")))]
+fn window_monitor_rect(_hwnd: usize) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod win {
     use std::ffi::c_void;
@@ -1912,6 +2133,8 @@ mod win {
     unsafe extern "system" {
         fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
         fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
+        fn MonitorFromWindow(hwnd: *mut c_void, flags: u32) -> *mut c_void;
+        fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
         fn SetWindowPos(
             hwnd: *mut c_void,
             insert_after: *mut c_void,
@@ -1921,6 +2144,52 @@ mod win {
             cy: i32,
             flags: u32,
         ) -> i32;
+    }
+
+    /// Win32 的 `RECT`。
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    pub struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    /// Win32 的 `MONITORINFO`。
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: Rect,
+        rc_work: Rect,
+        flags: u32,
+    }
+
+    /// `MONITOR_DEFAULTTONEAREST`
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
+    /// 窗口所在显示器的矩形（物理像素：左、上、右、下）。
+    ///
+    /// 用于算“屏幕下缘之外”的位置（滑动动效把窗口先挪到那里做不可见的切换）。
+    pub fn monitor_rect(hwnd: usize) -> Option<(i32, i32, i32, i32)> {
+        let hwnd = hwnd as *mut c_void;
+        unsafe {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_null() {
+                return None;
+            }
+            let mut info: MonitorInfo = std::mem::zeroed();
+            info.cb_size = std::mem::size_of::<MonitorInfo>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return None;
+            }
+            Some((
+                info.rc_monitor.left,
+                info.rc_monitor.top,
+                info.rc_monitor.right,
+                info.rc_monitor.bottom,
+            ))
+        }
     }
 
     const GWL_STYLE: i32 = -16;

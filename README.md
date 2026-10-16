@@ -159,8 +159,12 @@ troubleshooting.
 3. **Control** — the UI thread and the worker share an atomic control block
    (index / paused / stop reason), so Start, Pause, Stop and the global Esc hook all
    work without locks; the worker reports completion back to the UI
-4. **Countdown** — the main window is temporarily resized to a small bottom-centred
-   card and restored automatically before typing starts, so your target stays clickable
+4. **Countdown** — the main window slides down out of view, and the same window comes
+   back up from below the screen edge as a small bottom-centred card (borderless, with
+   rounded corners). The title bar, the client size and the rendered content are all
+   swapped while the window is off-screen, so the transition is a pure slide with no
+   flicker. When the countdown ends the card slides away and the main window rises back
+   into place before typing starts.
 5. **Colour emoji** — `egui`'s text pipeline can only rasterise glyph *outlines* and
    tint them with a single colour (coverage mask × vertex colour), so COLR v1 emoji
    would show up monochrome. This port adds the missing piece: `skrifa` traverses the
